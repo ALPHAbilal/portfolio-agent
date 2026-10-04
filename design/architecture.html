@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Portfolio agent: system design</title>
+<meta name="description" content="System design of an agent that turns every git push into a portfolio update that waits for the owner's approval.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Funnel+Sans:wght@300..800&family=Host+Grotesk:wght@700&family=JetBrains+Mono:wght@500&display=block">
+<style>
+  /* Brand: Frost Paper + fine grain. Colour and grain live only on the page background. */
+  :root { --bg: #eeece8; }
+  html, body { margin: 0; }
+  body {
+    background-color: var(--bg);
+    background-image:
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .16  0 0 0 0 .12  0 0 0 0 .08  0 0 0 .2 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>"),
+      radial-gradient(60% 50% at 96% 0%, rgba(240,90,26,.13) 0%, transparent 60%),
+      radial-gradient(50% 45% at 0% 100%, rgba(255,190,150,.22) 0%, transparent 60%);
+    background-size: 220px 220px, 100% 100%, 100% 100%;
+    background-repeat: repeat, no-repeat, no-repeat;
+  }
+  svg { display: block; width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<svg id="fig" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2000 1060" role="img" aria-label="System design: a git push wakes an agent. The agent reads and proposes through an MCP server. Proposals pass a secret scan and wait in a queue. Only the owner's approval writes to the live site or the public GitHub repo."></svg>
+<script>
+const C = { panel: '#faf9f7', panelLine: '#e2ded7', frame: '#f4f2ee', frameLine: '#dcd8d0', ink: '#161514', text: '#6b6760',
+  line: '#8a857d', light: '#cbc6bd', accent: '#f05a1a' };
+// Roles (keys kept short): orange = THE focus of the view (one per view; orange line + orange text on white),
+// purple = our code, blue = outside service (dashed), pink = data (plain warm surface), green = rule / check,
+// grey = muted.  [fill, stroke, text ink, dashed?]
+const TONE = {
+  purple: ['#ffffff', '#d6d1c8', '#55514b'], orange: ['#ffffff', '#f05a1a', '#c2410c'],
+  blue: ['#ffffff', '#9a958d', '#55514b', true], pink: ['#f4f2ee', '#d6d1c8', '#55514b'],
+  green: ['#ffffff', '#161514', '#161514'], grey: ['#f4f2ee', '#d6d1c8', '#6b6760'] };
+const f = v => (Math.round(v * 10) / 10).toString();
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// ---------------------------------------------------------------------------
+// Drawing helpers
+// ---------------------------------------------------------------------------
+function text(x, y, s, { size = 22, weight = 400, fill = C.text, anchor = 'start', family = 'Funnel Sans', ls = 0 } = {}) {
+  return `<text x="${f(x)}" y="${f(y)}" font-family="'${family}', sans-serif" font-size="${size}" font-weight="${weight}" fill="${fill}" text-anchor="${anchor}" letter-spacing="${ls}">${esc(s)}</text>`;
+}
+function lines(x, y, rows, opts = {}, lead = 30) { return rows.map((r, i) => text(x, y + i * lead, r, opts)).join(''); }
+function badgeW(s) { return s.length * 10.4 + 26; }
+function badge(x, y, s, tone = 'purple', anchor = 'start') {        // (x, y) = left (or centre) of a 32px pill, vertical centre y
+  const [fill, stroke, ink] = TONE[tone], w = badgeW(s), x0 = anchor === 'middle' ? x - w / 2 : anchor === 'end' ? x - w : x;
+  return `<rect x="${f(x0)}" y="${f(y - 16)}" width="${f(w)}" height="32" rx="16" fill="#fff" stroke="${stroke}" stroke-width="1.8"/>` +
+    text(x0 + w / 2, y + 6, s, { size: 17, family: 'JetBrains Mono', fill: ink, anchor: 'middle', weight: 500 });
+}
+function rect(x, y, w, h, tone, r = 14, sw = null) {
+  const [fill, stroke, , dashed] = TONE[tone];
+  sw = sw ?? (tone === 'orange' ? 2.6 : tone === 'green' ? 2 : 2.2);
+  return `<rect x="${f(x + sw / 2)}" y="${f(y + sw / 2)}" width="${f(w - sw)}" height="${f(h - sw)}" rx="${r}" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"${dashed ? ' stroke-dasharray="9 7"' : ''}/>`;
+}
+// Box with a title, optional tech badge (top-right) and caption lines.
+function box(x, y, w, h, tone, title, { badge: b, rows = [], center = false, size = 30 } = {}) {
+  let s = rect(x, y, w, h, tone);
+  if (center) {
+    const block = size * 0.7 + rows.length * 30 + (b ? 44 : 0);
+    let base = y + h / 2 - block / 2 + size * 0.7;
+    s += text(x + w / 2, base, title, { size, weight: 600, fill: tone === 'orange' ? TONE.orange[2] : C.ink, anchor: 'middle' });
+    if (rows.length) s += lines(x + w / 2, base + 34, rows, { anchor: 'middle', fill: tone === 'orange' ? TONE.orange[2] : C.text });
+    if (b) s += badge(x + w / 2, base + rows.length * 30 + 30, b, tone, 'middle');
+    return s;
+  }
+  s += text(x + 28, y + 50, title, { size, weight: 600, fill: tone === 'orange' ? TONE.orange[2] : C.ink });
+  if (b) s += badge(x + w - 22, y + 40, b, tone, 'end');
+  if (rows.length) s += lines(x + 28, y + 90, rows, { fill: tone === 'orange' ? TONE.orange[2] : C.text });
+  return s;
+}
+function frame(x, y, w, h, label, { dashed = false, fill = C.frame, stroke = C.frameLine, size = 28, ink = C.text } = {}) {
+  return `<rect x="${f(x + 1.5)}" y="${f(y + 1.5)}" width="${f(w - 3)}" height="${f(h - 3)}" rx="26" fill="${fill}" stroke="${stroke}" stroke-width="2.2"${dashed ? ' stroke-dasharray="10 8"' : ''}/>` +
+    (label ? text(x + 36, y + 52, label, { size, weight: 600, fill: ink }) : '');
+}
+function stack(x, y, w, h, n, dx, dy, tone) {       // back copies behind a front card at (x, y)
+  let s = '';
+  for (let k = n; k >= 1; k--) s += rect(x + dx * k, y + dy * k, w, h, tone);
+  return s;
+}
+function chevron(tx, ty, dx, dy, L = 16) {
+  const a = Math.atan2(dy, dx), p = k => [tx + L * Math.cos(a + Math.PI + k * Math.PI / 4), ty + L * Math.sin(a + Math.PI + k * Math.PI / 4)];
+  const [p1, p2] = [p(1), p(-1)];
+  return `M${f(p1[0])} ${f(p1[1])} L${f(tx)} ${f(ty)} L${f(p2[0])} ${f(p2[1])}`;
+}
+function rounded(pts, r = 14) {
+  let d = `M${f(pts[0][0])} ${f(pts[0][1])}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const [a, b, c] = [pts[i - 1], pts[i], pts[i + 1]];
+    const l1 = Math.hypot(b[0] - a[0], b[1] - a[1]), l2 = Math.hypot(c[0] - b[0], c[1] - b[1]);
+    const u1 = [(b[0] - a[0]) / l1, (b[1] - a[1]) / l1], u2 = [(c[0] - b[0]) / l2, (c[1] - b[1]) / l2];
+    const rr = Math.min(r, l1 / 2, l2 / 2), sweep = u1[0] * u2[1] - u1[1] * u2[0] > 0 ? 1 : 0;
+    d += ` L${f(b[0] - u1[0] * rr)} ${f(b[1] - u1[1] * rr)} A${f(rr)} ${f(rr)} 0 0 ${sweep} ${f(b[0] + u2[0] * rr)} ${f(b[1] + u2[1] * rr)}`;
+  }
+  const z = pts[pts.length - 1];
+  return d + ` L${f(z[0])} ${f(z[1])}`;
+}
+// Arrow along orthogonal points; head at the end (and the start when both).
+function arrow(pts, { dashed = false, light = false, both = false } = {}) {
+  const col = light ? C.light : C.line, z = pts[pts.length - 1], y = pts[pts.length - 2];
+  let d = rounded(pts) + ' ' + chevron(z[0], z[1], z[0] - y[0], z[1] - y[1]);
+  if (both) d += ' ' + chevron(pts[0][0], pts[0][1], pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]);
+  const line = `<path d="${rounded(pts)}" fill="none" stroke="${col}" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"${dashed ? ' stroke-dasharray="9 9"' : ''}/>`;
+  const heads = `<path d="${chevron(z[0], z[1], z[0] - y[0], z[1] - y[1])}${both ? ' ' + chevron(pts[0][0], pts[0][1], pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]) : ''}" fill="none" stroke="${col}" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>`;
+  return line + heads;
+}
+function note(x, y, s, { anchor = 'middle', size = 22 } = {}) { return text(x, y, s, { size, anchor }); }
+// Pill used for the plain-English "why it's cheap" points.
+function chip(x, y, s) {                           // neutral pill, orange dot
+  const w = s.length * 11.2 + 48;
+  return { w, svg: `<rect x="${f(x)}" y="${f(y)}" width="${f(w)}" height="46" rx="23" fill="#ffffff" stroke="#dcd8d0" stroke-width="1.8"/>` +
+    `<circle cx="${f(x + 22)}" cy="${f(y + 23)}" r="5" fill="#b5b0a7"/>` + text(x + 36, y + 30, s, { size: 20, weight: 600, fill: C.ink }) };
+}
+function chipRow(x, y, items, tone = 'green', gap = 16) {
+  let s = '', cx = x;
+  for (const it of items) { const c = chip(cx, y, it, tone); s += c.svg; cx += c.w + gap; }
+  return s;
+}
+
+const W = 2000, H = 1060;
+const kicker = text(90, 84, 'PORTFOLIO AGENT · SYSTEM DESIGN', { size: 18, family: 'JetBrains Mono', weight: 500, ls: 2 });
+const title = text(90, 146, 'The agent proposes. Only you publish.', { size: 56, family: 'Host Grotesk', weight: 700, fill: C.ink, ls: -1 });
+const body =
+  frame(470, 240, 1110, 740, 'Cloudflare') +
+  // outside, left
+  box(90, 320, 300, 170, 'blue', 'Private repo', { center: true, badge: 'GitHub', rows: ['real code'] }) +
+  box(90, 560, 300, 170, 'blue', 'Build & tests', { center: true, badge: 'GitHub Actions' }) +
+  // inside Cloudflare
+  box(510, 320, 290, 340, 'purple', 'Agent', { center: true, badge: 'Claude API', rows: ['reads the push', 'drafts the update', 'asks for a build'] }) +
+  box(510, 730, 290, 170, 'purple', 'Wake-up', { center: true, rows: ['push · daily', 'run now · chat'] }) +
+  box(880, 320, 290, 170, 'purple', 'MCP server', { center: true, badge: 'MCP', rows: ['read · propose'] }) +
+  box(880, 560, 290, 100, 'green', 'Secret scan', { center: true }) +
+  box(880, 730, 290, 170, 'pink', 'Proposals', { center: true, badge: 'D1', rows: ['waiting for you'] }) +
+  box(1250, 320, 290, 170, 'pink', 'Live content', { center: true, badge: 'D1', rows: ['the real site'] }) +
+  box(1250, 730, 290, 170, 'orange', 'You approve', { center: true, badge: 'Inbox', rows: ['approve · edit · reject'] }) +
+  // outside, right
+  box(1660, 320, 250, 170, 'purple', 'bilalchafi.com', { center: true, rows: ['new entry live'] }) +
+  box(1660, 730, 250, 170, 'blue', 'Public repo', { center: true, badge: 'GitHub', rows: ['clean copy'] }) +
+  // arrows
+  arrow([[390, 405], [496, 405]]) + note(443, 385, 'push', { size: 20 }) +
+  arrow([[390, 645], [496, 645]], { both: true }) +
+  arrow([[655, 730], [655, 674]]) +
+  arrow([[800, 405], [866, 405]]) +
+  arrow([[1236, 405], [1184, 405]]) + note(1210, 385, 'read', { size: 20 }) +
+  arrow([[1025, 490], [1025, 546]]) +
+  arrow([[1025, 660], [1025, 716]]) +
+  arrow([[1170, 815], [1236, 815]]) +
+  arrow([[1395, 716], [1395, 504]]) + note(1440, 620, 'approve', { size: 20, anchor: 'start' }) +
+  arrow([[1540, 405], [1646, 405]]) + note(1593, 385, 'publish', { size: 20 }) +
+  arrow([[1540, 815], [1646, 815]]) + note(1593, 795, 'publish', { size: 20 }) +
+  note(470, 1030, 'MCP: the standard way AI connects to tools', { size: 20, anchor: 'start' });
+document.getElementById('fig').innerHTML = kicker + title + body;
+</script>
+</body>
+</html>
